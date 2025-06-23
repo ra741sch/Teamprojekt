@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>GPS Simulation Tracker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    .button {
+      position: absolute;
+      top: 10px;
+      padding: 10px;
+      font-size: 16px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      z-index: 1000;
+    }
+    #startBtn { left: 10px; }
+    #backBtn { left: 140px; background-color: #dc3545; }
+    #toggleBtn { left: 270px; background-color: orange; }
+    #infoBox {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: white;
+      padding: 8px 12px;
+      font-family: sans-serif;
+      font-size: 14px;
+      border-radius: 5px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.3);
+      z-index: 1000;
+      min-width: 200px;
+    }
+    #speedControl {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      background: white;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-family: sans-serif;
+      font-size: 14px;
+      box-shadow: 0 0 4px rgba(0,0,0,0.3);
+      z-index: 1000;
+    }
+  </style>
+</head>
+<body>
+  <button id="startBtn" class="button">📍 Start Tracking</button>
+  <button id="backBtn" class="button">🔙 Zurück</button>
+  <button id="toggleBtn" class="button">⏸️ Pause</button>
+  <div id="infoBox">⏱️ Letztes Update: –<br>🚀 Geschwindigkeit: –<br>📈 Ø-Tempo: –<br>📏 Reststrecke: –<br>✅ Zurückgelegt: –<br>🧭 Gesamtstrecke: –<br>🎯 Ziel: – / –<br>⏳ Timer: 05:00.000</div>
+  <div id="map"></div>
+  <div id="speedControl">
+    Geschwindigkeit (km/h): <span id="simSpeedLabel">30</span><br>
+    <input type="range" id="simSpeedSlider" min="5" max="100" value="30">
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+  <script>
+    // Grundeinstellungen & Karte
+    const map = L.map('map').setView([47.7, 9.0], 17);
+    L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Tiles © Esri'
+    }).addTo(map);
+    L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19
+    }).addTo(map);
+
+    // Globale Variablen
+    const useSimulation = true;
+    const routePoints = [];
+    const pointMarkers = [];
+    let polyline = null;
+    let turfLine = null;
+    let trackingStarted = false;
+    let gpsWatcher = null;
+    let gpsPaused = false;
+    let simulationSpeedKmh = 30;
+    let simulationInterval = null;
+    let simulationDistance = 0;
+    let lastUpdateTime = null;
+    let currentSpeed = null;
+    let countdownDuration = 5 * 60 * 1000;
+    let countdownStart = null;
+    let countdownInterval = null;
+    let totalDistance = 0;
+    let distanceCovered = 0;
+    let distanceToGoal = 0;
+    let averageSpeed = 0;
+    let suggestedSpeedLower = 0;
+    let suggestedSpeedUpper = 0;
+    let remainingCountdown = null;
+    let firstPositionSet = false;
+
+    const infoBox = document.getElementById("infoBox");
+    const toggleBtn = document.getElementById("toggleBtn");
+
+    document.getElementById("simSpeedSlider").addEventListener("input", (e) => {
+      simulationSpeedKmh = Number(e.target.value);
+      document.getElementById("simSpeedLabel").textContent = simulationSpeedKmh;
+    });
+
+    map.on('click', e => {
+      if (trackingStarted) return;
+      const latlng = [e.latlng.lat, e.latlng.lng];
+      routePoints.push(latlng);
+      const color = routePoints.length === 1 ? 'magenta' : 'blue';
+      const marker = L.circleMarker(latlng, { radius: 5, color }).addTo(map);
+      pointMarkers.push(marker);
+      drawPolyline();
+      updateDistance();
+    });
+
+    function drawPolyline() {
+      if (polyline) map.removeLayer(polyline);
+      if (routePoints.length >= 2) {
+        polyline = L.polyline(routePoints, { color: 'blue' }).addTo(map);
+      }
+    }
+
+    function updateDistance() {
+      totalDistance = 0;
+      if (routePoints.length >= 2) {
+        for (let i = 1; i < routePoints.length; i++) {
+          const from = turf.point([routePoints[i - 1][1], routePoints[i - 1][0]]);
+          const to = turf.point([routePoints[i][1], routePoints[i][0]]);
+          totalDistance += turf.distance(from, to, { units: 'meters' });
+        }
+      }
+    }
+
+    document.getElementById("backBtn").addEventListener("click", () => {
+      if (trackingStarted || routePoints.length === 0) return;
+      routePoints.pop();
+      const lastMarker = pointMarkers.pop();
+      if (lastMarker) map.removeLayer(lastMarker);
+      drawPolyline();
+      updateDistance();
+    });
+
+    document.getElementById("startBtn").addEventListener("click", () => {
+      if (routePoints.length < 2) {
+        alert("Bitte zuerst eine Strecke zeichnen!");
+        return;
+      }
+      if (!routePoints[0].every((val, i) => val === routePoints[routePoints.length - 1][i])) {
+        routePoints.push(routePoints[0]);
+      }
+      trackingStarted = true;
+      document.getElementById("startBtn").disabled = true;
+      document.getElementById("backBtn").disabled = true;
+      turfLine = turf.lineString(routePoints.map(p => [p[1], p[0]]));
+      updateDistance();
+      distanceCovered = 0;
+      distanceToGoal = totalDistance;
+      startCountdown(countdownDuration);
+      startLiveGPS();
+    });
+
+    toggleBtn.addEventListener("click", () => {
+      if (!trackingStarted) return;
+      gpsPaused = !gpsPaused;
+      toggleBtn.innerText = gpsPaused ? "▶️ Weiter" : "⏸️ Pause";
+      toggleBtn.style.backgroundColor = gpsPaused ? "green" : "orange";
+      if (gpsPaused) {
+        if (gpsWatcher !== null) navigator.geolocation.clearWatch(gpsWatcher);
+        clearInterval(simulationInterval);
+        clearInterval(countdownInterval);
+        remainingCountdown = countdownDuration - (Date.now() - countdownStart);
+      } else {
+        startCountdown(remainingCountdown);
+        startLiveGPS();
+      }
+    });
+
+    function startCountdown(duration) {
+      countdownStart = Date.now();
+      countdownInterval = setInterval(() => {
+        const elapsed = Date.now() - countdownStart;
+        const remaining = duration - elapsed;
+        if (remaining <= 0) {
+          clearInterval(countdownInterval);
+          updateInfoBoxTime(0);
+        } else {
+          updateInfoBoxTime(remaining);
+        }
+      }, 50);
+    }
+
+    function updateInfoBoxTime(ms) {
+      const min = Math.floor(ms / 60000);
+      const sec = Math.floor((ms % 60000) / 1000);
+      const msms = ms % 1000;
+      const timeStr = `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${String(msms).padStart(3, '0')}`;
+      infoBox.innerHTML = infoBox.innerHTML.replace(/⏳ Timer: .*$/m, `⏳ Timer: ${timeStr}`);
+    }
+
+    function updateInfoBox() {
+      if (!trackingStarted || gpsPaused) return;
+      let speedText = `🚀 Geschwindigkeit: –`;
+      let avgSpeedText = `📈 Ø-Tempo: –`;
+      let restText = `📏 Reststrecke: ${distanceToGoal.toFixed(1)} m`;
+      let doneText = `✅ Zurückgelegt: ${distanceCovered.toFixed(1)} m`;
+      let totalText = `🧭 Gesamtstrecke: ${totalDistance.toFixed(1)} m`;
+      let goalText = `🎯 Ziel: – / –`;
+      if (currentSpeed !== null) {
+        speedText = `🚀 Geschwindigkeit: ${(currentSpeed * 3.6).toFixed(1)} km/h`;
+      }
+      const elapsed = Date.now() - countdownStart;
+      if (elapsed > 0 && distanceCovered > 0) {
+        averageSpeed = distanceCovered / (elapsed / 1000);
+        avgSpeedText = `📈 Ø-Tempo: ${(averageSpeed * 3.6).toFixed(1)} km/h`;
+        const remainingTime = countdownDuration - elapsed;
+        if (remainingTime > 0) {
+          const rounds = (averageSpeed * remainingTime / 1000) / totalDistance;
+          const lower = Math.floor(rounds);
+          const upper = lower + 1;
+          suggestedSpeedLower = ((lower * totalDistance) / (remainingTime / 1000)) * 3.6;
+          suggestedSpeedUpper = ((upper * totalDistance) / (remainingTime / 1000)) * 3.6;
+          goalText = `🎯 Ziel: ${suggestedSpeedLower.toFixed(1)} ↓ / ${suggestedSpeedUpper.toFixed(1)} ↑ km/h`;
+        }
+      }
+      const timeText = `⏱️ Letztes Update: ${(Date.now() - lastUpdateTime) / 1000).toFixed(2)} s`;
+      infoBox.innerHTML = `${timeText}<br>${speedText}<br>${avgSpeedText}<br>${restText}<br>${doneText}<br>${totalText}<br>${goalText}<br>` + infoBox.innerHTML.match(/⏳ Timer: .*/)[0];
+    }
+    setInterval(updateInfoBox, 250);
+
+    function startLiveGPS() {
+      if (useSimulation) return startSimulation();
+      if (!navigator.geolocation) return alert("GPS nicht verfügbar");
+      gpsWatcher = navigator.geolocation.watchPosition(onGpsPosition);
+    }
+
+    function startSimulation() {
+      let lastSimUpdate = Date.now();
+      simulationInterval = setInterval(() => {
+        if (!trackingStarted || gpsPaused) return;
+        const now = Date.now();
+        const delta = (now - lastSimUpdate) / 1000;
+        lastSimUpdate = now;
+        const speedMps = simulationSpeedKmh / 3.6;
+        simulationDistance += speedMps * delta;
+        const t = (simulationDistance % totalDistance) / totalDistance;
+        const point = turf.along(turfLine, totalDistance * t, { units: 'meters' });
+        onGpsPosition({ coords: { latitude: point.geometry.coordinates[1], longitude: point.geometry.coordinates[0], speed: speedMps } });
+      }, 100);
+    }
+
+    function onGpsPosition(pos) {
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const speed = pos.coords.speed;
+      currentSpeed = speed;
+      lastUpdateTime = Date.now();
+      const currentPoint = turf.point([lng, lat]);
+      const snapped = turf.nearestPointOnLine(turfLine, currentPoint);
+      const snappedLatLng = [snapped.geometry.coordinates[1], snapped.geometry.coordinates[0]];
+
+      pointMarkers.forEach(m => { if (m.options.color === 'red') map.removeLayer(m); });
+      const red = L.circleMarker(snappedLatLng, { radius: 6, color: 'red' }).addTo(map);
+      const yellow = L.circleMarker([lat, lng], { radius: 4, color: 'yellow' }).addTo(map);
+      pointMarkers.push(red, yellow);
+
+      const sliced = turf.lineSlice(turf.point(routePoints[0].slice().reverse()), snapped, turfLine);
+      distanceCovered = turf.length(sliced, { units: 'meters' });
+      distanceToGoal = totalDistance - distanceCovered;
+      map.setView([lat, lng]);
+    }
+  </script>
+</body>
+</html>
